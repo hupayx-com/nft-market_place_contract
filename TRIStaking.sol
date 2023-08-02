@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity 0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract TRIStaking is
     Ownable,
@@ -29,14 +30,15 @@ contract TRIStaking is
         uint stakeTotal;
     }
 
-    IERC20 public originToken;
+    using SafeERC20 for IERC20;
+    IERC20 immutable public originToken;
 
     uint256 public totalPooledOrigin;
     uint256 public totalPooledStake;
     uint256 public totalPooledOriginDisplay;
     
     uint256 public earMarkedTimestamp;
-    uint256 public startInflationFromTimestamp;
+    uint256 immutable public startInflationFromTimestamp;
     uint256 public inflationPerSec = 0.11890046 ether;
     uint256 public minimumStakingAmount = 0.000001 ether;
     mapping(string => Policy) public policyMap;
@@ -60,11 +62,11 @@ contract TRIStaking is
         _updatePoolState();
     }
 
-    function pause() public onlyOwner {
+    function pause() external onlyOwner {
         _pause();
     }
 
-    function unpause() public onlyOwner {
+    function unpause() external onlyOwner {
         _unpause();
     }
 
@@ -76,23 +78,23 @@ contract TRIStaking is
         return stakeInfoMap[_addr].length;
     }
 
-    function depositReserve(uint256 _amount) public onlyOwner {
-        originToken.transferFrom(msg.sender, address(this), _amount);
+    function depositReserve(uint256 _amount) external onlyOwner {
+        originToken.safeTransferFrom(msg.sender, address(this), _amount);
         emit DepositReserve(msg.sender, _amount);
     }
 
-    function withdrawReserve(uint _amount) public onlyOwner {
+    function withdrawReserve(uint _amount) external onlyOwner {
         require(
             _amount <= originToken.balanceOf(address(this)) - _getTotalPooledOrigin(),
-            "requested amount exceeds the treasury"
+            "amount exceeds the treasury"
         );
-        originToken.transfer(msg.sender, _amount);
+        originToken.safeTransfer(msg.sender, _amount);
         emit WithdrawReserve(msg.sender, _amount);
     }
 
-    function setPolicy(string memory _key, uint _lockupSec, uint _bonusPer) public onlyOwner {       
-        require(_lockupSec > 0, "Lockup sec must be bigger then 0");
-        require(_bonusPer >= 0, "BonusPer sec must be bigger then 0");
+    function setPolicy(string memory _key, uint _lockupSec, uint _bonusPer) external onlyOwner {       
+        require(_lockupSec > 0, "Invalid lockupSec");
+        require(_bonusPer >= 0, "Invalid bonusPer");
 
         policyMap[_key] = Policy({
             lockupSec: _lockupSec,
@@ -100,7 +102,7 @@ contract TRIStaking is
         });
     }
 
-    function removePolicy(string memory _key) public onlyOwner {       
+    function removePolicy(string memory _key) external onlyOwner {       
         policyMap[_key].lockupSec = 0;
         policyMap[_key].bonusPer = 0;
     }
@@ -116,18 +118,19 @@ contract TRIStaking is
         }));
     }
 
-    function changeInflation(uint _inflationPerSec) public onlyOwner {
+    function changeInflation(uint _inflationPerSec) external onlyOwner {
         totalPooledOrigin = _getTotalPooledOrigin();
+        earMarkedTimestamp = currentTime();
         _updatePoolState();
         inflationPerSec = _inflationPerSec;
     }
 
-    function updatePoolStateExplicitly() public {
+    function updatePoolStateExplicitly() external {
         totalPooledOrigin = _getTotalPooledOrigin();
         _updatePoolState();
     }
 
-    function changeMinimumStakeAmount(uint _amount) public onlyOwner {
+    function changeMinimumStakeAmount(uint _amount) external onlyOwner {
         minimumStakingAmount = _amount;
     }
 
@@ -150,9 +153,8 @@ contract TRIStaking is
         if (_timestamp >= poolStateList[lastIndex].timestamp) {
             return poolStateList[lastIndex];
         }
-        if (_timestamp < poolStateList[0].timestamp) {
-            revert("No pool state available before the given timestamp");
-        }
+
+        require(_timestamp >= poolStateList[0].timestamp, "Invalid timestamp");
 
         // Binary search
         while (low < high) {
@@ -179,7 +181,7 @@ contract TRIStaking is
         totalPooledStake += amountOfStakingToken;
         totalPooledOriginDisplay += stakeAmount;
 
-        originToken.transferFrom(msg.sender, address(this), _amount);
+        originToken.safeTransferFrom(msg.sender, address(this), _amount);
 
         uint stakeTime = (earMarkedTimestamp < startInflationFromTimestamp ? startInflationFromTimestamp : earMarkedTimestamp);
         _updatePoolState();
@@ -209,7 +211,7 @@ contract TRIStaking is
         totalPooledStake -= stakeInfo.stakeAmount;
         totalPooledOriginDisplay -= stakeInfo.totalAmount;
 
-        originToken.transfer(msg.sender, reward + stakeInfo.realAmount);
+        originToken.safeTransfer(msg.sender, reward + stakeInfo.realAmount);
 
         _updatePoolState();
         emit Unstake(msg.sender, stakeInfo.realAmount, stakeInfo.totalAmount, stakeInfo.stakeAmount, reward, realAmountOfRewardToken);
@@ -217,7 +219,7 @@ contract TRIStaking is
     }
 
     function getTotalPooledOriginForDisplay() public view returns(uint) {
-        return totalPooledOrigin;
+        return totalPooledOriginDisplay;
     }
 
     function getTotalPooledOrigin() public view returns(uint256) {
@@ -231,7 +233,8 @@ contract TRIStaking is
         uint _totalAmount = _originToken * (100 + policyMap[_policyKey].bonusPer) / 100;
         uint _stakeAmount = convertOriginTokenToStaking(_totalAmount);
         uint _totalPooledStake = totalPooledStake + _stakeAmount;
-        uint _totalPooledOriginAfterLockupTime = _totalAmount + _getTotalPooledOriginAtTime(currentTime() + policyMap[_policyKey].lockupSec);
+        uint _endTime = (currentTime() < startInflationFromTimestamp ? startInflationFromTimestamp : currentTime()) + policyMap[_policyKey].lockupSec;
+        uint _totalPooledOriginAfterLockupTime = _totalAmount + _getTotalPooledOriginAtTime(_endTime);
 
         uint256 amountOfRewardToken = _convertStakingTokenToOrigin(_stakeAmount, _totalPooledStake, _totalPooledOriginAfterLockupTime);
         return amountOfRewardToken - _totalAmount; // real reward
@@ -288,18 +291,18 @@ contract TRIStaking is
         if (currentTime() <= startInflationFromTimestamp) return totalPooledOrigin;
         if (totalPooledStake == 0) return totalPooledOrigin;
 
-        uint256 _inflation = inflationPerSec * (currentTime() - earMarkedTimestamp);
+        uint256 markedTimeStamp = earMarkedTimestamp < startInflationFromTimestamp ? startInflationFromTimestamp : earMarkedTimestamp;
+        uint256 _inflation = inflationPerSec * (currentTime() - markedTimeStamp);
         uint256 _contractBalance = originToken.balanceOf(address(this));
         if (totalPooledOrigin + _inflation > _contractBalance) return _contractBalance;
         return totalPooledOrigin + _inflation;
     }
 
     function _getTotalPooledOriginAtTime(uint _timeStamp) internal view returns (uint256) {
-        if (_timeStamp <= startInflationFromTimestamp) return 0;
-        if (_timeStamp < currentTime()) return 0;
-
         uint _earMarkedTimestamp = earMarkedTimestamp;
-        if (totalPooledStake == 0) {
+        if (_earMarkedTimestamp < startInflationFromTimestamp && currentTime() < startInflationFromTimestamp) {
+            _earMarkedTimestamp = startInflationFromTimestamp;
+        } else if (totalPooledStake == 0) {
             _earMarkedTimestamp = currentTime();
         }
 

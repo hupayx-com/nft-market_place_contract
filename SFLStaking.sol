@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity 0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract SFLStaking is
     Ownable,
@@ -30,14 +31,15 @@ contract SFLStaking is
         uint rewardTotal;
     }
 
-    IERC20 public stakeToken;
+    using SafeERC20 for IERC20;
+    IERC20 immutable public stakeToken;
 
     uint256 public totalPooledOrigin;
     uint256 public totalPooledStake;
     uint256 public totalPooledReward;
     
     uint256 public earMarkedTimestamp;
-    uint256 public startInflationFromTimestamp;
+    uint256 immutable public startInflationFromTimestamp;
     uint256 public inflationPerSec = 0.15854166 ether;
     uint256 public minimumStakingAmount = 0.000001 ether;
     mapping(string => Policy) public policyMap;
@@ -59,11 +61,11 @@ contract SFLStaking is
         _updatePoolState();
     }
 
-    function pause() public onlyOwner {
+    function pause() external onlyOwner {
         _pause();
     }
 
-    function unpause() public onlyOwner {
+    function unpause() external onlyOwner {
         _unpause();
     }
 
@@ -75,17 +77,17 @@ contract SFLStaking is
         return stakeInfoMap[_addr].length;
     }
 
-    function withdrawStakeToken(uint _amount) public onlyOwner {
+    function withdrawStakeToken(uint _amount) external onlyOwner {
         require(
             _amount <= stakeToken.balanceOf(address(this)) - _getTotalPooledReward(),
-            "requested amount exceeds the treasury"
+            "amount exceeds the treasury"
         );
-        stakeToken.transferFrom(address(this), msg.sender, _amount);
+        stakeToken.safeTransfer(msg.sender, _amount);
     }
 
-    function setPolicy(string memory _key, uint _lockupSec, uint _bonusPer) public onlyOwner {       
-        require(_lockupSec > 0, "Lockup sec must be bigger then 0");
-        require(_bonusPer >= 0, "BonusPer sec must be bigger then 0");
+    function setPolicy(string memory _key, uint _lockupSec, uint _bonusPer) external onlyOwner {       
+        require(_lockupSec > 0, "Invlid lockupSec");
+        require(_bonusPer >= 0, "Invlid bonusPer");
 
         policyMap[_key] = Policy({
             lockupSec: _lockupSec,
@@ -93,7 +95,7 @@ contract SFLStaking is
         });
     }
 
-    function removePolicy(string memory _key) public onlyOwner {       
+    function removePolicy(string memory _key) external onlyOwner {       
         policyMap[_key].lockupSec = 0;
         policyMap[_key].bonusPer = 0;
     }
@@ -109,19 +111,20 @@ contract SFLStaking is
         }));
     }
 
-    function changeInflation(uint _inflationPerSec) public onlyOwner {
+    function changeInflation(uint _inflationPerSec) external onlyOwner {
         totalPooledReward = _getTotalPooledReward();
+        earMarkedTimestamp = currentTime();
         _updatePoolState();
         inflationPerSec = _inflationPerSec;
     }
 
-    function updatePoolStateExplicitly() public {
+    function updatePoolStateExplicitly() external {
         totalPooledReward = _getTotalPooledReward();
         earMarkedTimestamp = currentTime();
         _updatePoolState();
     }
 
-    function changeMinimumStakeAmount(uint _amount) public onlyOwner {
+    function changeMinimumStakeAmount(uint _amount) external onlyOwner {
         minimumStakingAmount = _amount;
     }
 
@@ -145,9 +148,8 @@ contract SFLStaking is
         if (_timestamp >= poolStateList[lastIndex].timestamp) {
             return poolStateList[lastIndex];
         }
-        if (_timestamp < poolStateList[0].timestamp) {
-            revert("No pool state available before the given timestamp");
-        }
+
+        require(_timestamp >= poolStateList[0].timestamp, "Invalid timestamp");
 
         // Binary search
         while (low < high) {
@@ -204,7 +206,7 @@ contract SFLStaking is
 
         address payable sender = payable(msg.sender);
         sender.transfer(stakeInfo.realAmount);
-        stakeToken.transfer(msg.sender, reward);
+        stakeToken.safeTransfer(msg.sender, reward);
 
         _updatePoolState();
         emit Unstake(msg.sender, stakeInfo.realAmount, stakeInfo.totalAmount, stakeInfo.stakeAmount, reward, realReward);
@@ -230,7 +232,8 @@ contract SFLStaking is
         uint _stakeAmount = _originToken * (100 + policyMap[_policyKey].bonusPer) / 100;
         uint _stakeToken = convertOriginTokenToStaking(_stakeAmount);
         uint _totalPooledStake = totalPooledStake + _stakeToken;
-        uint _totalPooledOriginAfterLockupTime = _stakeAmount + _getTotalPooledOriginAndRewardAtTime(currentTime() + policyMap[_policyKey].lockupSec);
+        uint _endTime = (currentTime() < startInflationFromTimestamp ? startInflationFromTimestamp : currentTime()) + policyMap[_policyKey].lockupSec;
+        uint _totalPooledOriginAfterLockupTime = _stakeAmount + _getTotalPooledOriginAndRewardAtTime(_endTime);
 
         uint256 amountOfRewardToken = _convertStakingTokenToOriginAndReward(_stakeToken, _totalPooledStake, _totalPooledOriginAfterLockupTime);
         return amountOfRewardToken - _stakeAmount;
@@ -291,18 +294,18 @@ contract SFLStaking is
         if (currentTime() <= startInflationFromTimestamp) return 0;
         if (totalPooledStake == 0) return 0;
 
-        uint256 _inflation = inflationPerSec * (currentTime() - earMarkedTimestamp);
+        uint256 markedTimeStamp = earMarkedTimestamp < startInflationFromTimestamp ? startInflationFromTimestamp : earMarkedTimestamp;
+        uint256 _inflation = inflationPerSec * (currentTime() - markedTimeStamp);
         uint256 _contractBalance = stakeToken.balanceOf(address(this));
         if (totalPooledReward + _inflation > _contractBalance) return _contractBalance;
         return totalPooledReward + _inflation;    
     }
 
     function _getTotalPooledOriginAndRewardAtTime(uint _timeStamp) internal view returns (uint256) {
-        if (_timeStamp <= startInflationFromTimestamp) return 0;
-        if (_timeStamp < currentTime()) return 0;
-
         uint _earMarkedTimestamp = earMarkedTimestamp;
-        if (totalPooledStake == 0) {
+        if (_earMarkedTimestamp < startInflationFromTimestamp && currentTime() < startInflationFromTimestamp) {
+            _earMarkedTimestamp = startInflationFromTimestamp;
+        } else if (totalPooledStake == 0) {
             _earMarkedTimestamp = currentTime();
         }
 
